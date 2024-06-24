@@ -1,0 +1,172 @@
+Parameters:
+
+  ClusterID:
+    Type: String
+    Description: "A unique dientifier for this stack to differentiate resources in this stack to resources in other stacks, allowing for idempotency"
+
+  VpcId:
+    Type: String
+    Description: "ID of the VPC where the ECS cluster and other resources will be deployed"
+    AllowedPattern: "^vpc-([0-9a-f]{8}|[0-9a-f]{17})$"
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "Subnet IDs for deploying the ECS service"
+    AllowedPattern: "^subnet-([0-9a-f]{8}|[0-9a-f]{17})$"
+  
+  EcsExecutionRoleArn:
+    Type: String
+    Description: "The arn of the IAm Role for ECS Execution"
+    AllowedPattern: "^arn:aws:iam::\\d{12}:role/[a-zA-Z0-9-]+$"
+
+Resources:
+
+  TaskRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "task-role-${ClusterID}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "ECSTaskRolePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ClusterID}-*"
+
+  SeedTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      Family: "nats-seed-cluster"
+      Cpu: "2048"
+      Memory: "4096"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - 'FARGATE'
+      ExecutionRoleArn: !Ref EcsExecutionRoleArn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: "nats-seed"
+          Image: "nats:latest"
+          Essential: true
+          Command:
+            - "-D"
+            - "-V"
+            - "-cluster"
+            - "nats://0.0.0.0:6222"
+          PortMappings:
+            - ContainerPort: 4222
+            - ContainerPort: 6222
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-create-group: "true"
+              awslogs-group: !Sub "/ecs/${ClusterID}-nats"
+              awslogs-region: !Sub "${AWS::Region}"
+              awslogs-stream-prefix: "ecs"
+
+  PrivateDnsNamespace:
+    Type: "AWS::ServiceDiscovery::PrivateDnsNamespace"
+    Properties:
+      Name: !Sub "nats.local.${ClusterID}"
+      Vpc: !Ref VpcId
+
+  SeedDiscoveryService:
+    Type: "AWS::ServiceDiscovery::Service"
+    Properties:
+      Name: !Sub "nats-seed-${ClusterID}"
+      DnsConfig:
+        NamespaceId: !Ref PrivateDnsNamespace
+        DnsRecords:
+          - Type: "A"
+            TTL: "60"
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  NodeDiscoveryService:
+    Type: "AWS::ServiceDiscovery::Service"
+    Properties:
+      Name: !Sub "nats-node-${ClusterID}"
+      DnsConfig:
+        NamespaceId: !Ref PrivateDnsNamespace
+        DnsRecords:
+          - Type: "A"
+            TTL: "60"
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  NodeTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      Family: !Sub "nats-node-cluster-${ClusterID}"
+      Cpu: "2048"
+      Memory: "4096"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - 'FARGATE'
+      ExecutionRoleArn: !Ref EcsExecutionRoleArn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Sub "nats-node-${ClusterID}"
+          Image: "nats:latest"
+          Essential: true
+          Command:
+            - "-D"
+            - "-V"
+            - "-cluster"
+            - "nats://0.0.0.0:6222"
+            - "-routes"
+            - !Sub "nats-route://nats-seed-${ClusterID}.nats.local.${ClusterID}:6222"
+          PortMappings:
+            - ContainerPort: 4222
+            - ContainerPort: 6222
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-create-group: "true"
+              awslogs-group: !Sub "/ecs/${ClusterID}-nats"
+              awslogs-region: !Sub "${AWS::Region}"
+              awslogs-stream-prefix: "ecs"
+
+  SeedService:
+    Type: "AWS::ECS::Service"
+    Properties:
+      Cluster: !Ref EcsClusterArn
+      TaskDefinition: !Ref SeedTaskDefinition
+      DesiredCount: 1
+      LaunchType: "FARGATE"
+      ServiceRegistries:
+        - RegistryArn: !GetAtt SeedDiscoveryService.Arn
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          AssignPublicIp: "DISABLED"
+          SecurityGroups:
+            - !Ref SecurityGroupId
+
+  NodeService:
+    Type: "AWS::ECS::Service"
+    DependsOn: SeedService
+    Properties:
+      Cluster: !Ref EcsClusterArn
+      TaskDefinition: !Ref NodeTaskDefinition
+      ServiceRegistries:
+        - RegistryArn: !GetAtt NodeDiscoveryService.Arn
+      DesiredCount: 2
+      LaunchType: "FARGATE"
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          AssignPublicIp: "DISABLED"
+          SecurityGroups:
+            - !Ref SecurityGroupId
